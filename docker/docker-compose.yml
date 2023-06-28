@@ -1,20 +1,54 @@
 version: "3.2"
 
 services:
+  gateway_db:
+    image: postgres
+    restart: always
+    ports:
+      - '25432:25432'
+    environment:
+      POSTGRES_DB: "gateway"
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "postgres"
+      PGPORT: 25432
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 1s
+      timeout: 1s
+      retries: 15
+
+  mindsdb_db:
+    image: postgres
+    restart: always
+    ports:
+      - '15432:15432'
+    environment:
+      POSTGRES_DB: "mindsdb"
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "postgres"
+      PGPORT: 15432
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 1s
+      timeout: 1s
+      retries: 15
 
   migrations:
     command: bash -c "cd /mindsdb && python ./mindsdb/migrations/migrate.py"
 
     <<: &globalSettings
-      build:
-        context: ../
-        dockerfile: ./docker/mindsdb.Dockerfile
+      depends_on:
+        mindsdb_db:
+          condition: service_healthy
+      image: mindsdb/mindsdb:latest
       volumes:
         - type: bind
-          source: ../
+          source: ./mindsdb_source
           target: /mindsdb
       environment:
         MINDSDB_STORAGE_DIR: "/mindsdb/var"
+        MINDSDB_DB_CON: "postgresql://postgres:postgres@mindsdb_db:15432/mindsdb"
+      platform: linux/amd64
 
   mindsdb:
     # Copy global settings from migration above
@@ -24,119 +58,104 @@ services:
       - '47334:47334'
       - '47335:47335'
       - '47336:47336'
-        # command: bash -c "cd /mindsdb && python -m mindsdb --api=http,mysql,mongodb"
-    command: bash -c "cd /mindsdb && python -m mindsdb --api=http,mysql,mongodb --config=tests/integration_tests/flows/config/docker_config.json"
+    command: bash -c "cd /mindsdb && python -m mindsdb --api=http,mysql,mongodb"
     environment:
-      MINDSDB_EXECUTOR_SERVICE_HOST: "executor"
-      MINDSDB_EXECUTOR_SERVICE_PORT: "50052"
-      MINDSDB_DB_SERVICE_HOST: "db_service"
-      MINDSDB_DB_SERVICE_PORT: "50050"
       MINDSDB_DOCKER_ENV: "True"
       MINDSDB_STORAGE_DIR: "/mindsdb/var"
+      MINDSDB_DB_CON: "postgresql://postgres:postgres@mindsdb_db:15432/mindsdb"
       FLASK_DEBUG: "1"
       FLASK_ENV: "development"
       FLASK_APP: "/mindsdb/mindsdb/__main__.py"
       SEPARATE_MIGRATIONS: "1"
+      OPENAI_API_KEY: "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"
     depends_on:
       - migrations
+    volumes:
+      - type: bind
+        source: .
+        target: /mindsdb
     healthcheck:
       test:  ["CMD", "curl", "-f", "http://localhost:47334/api/util/ping"]
       interval: 30s
       timeout: 4s
       retries: 100
 
-  lightwood:
-    build:
-      context: ../
-      dockerfile: ./docker/ml_handler.Dockerfile
+  proxy:
+    image: nginx:latest
     depends_on:
-      - mindsdb
+      - gateway
     volumes:
-      - type: bind
-        source: ../
-        target: /mindsdb
-    environment:
-      # have to share mindsdb database, because it doens't work without it
-      REGISTRY_URL: "http://handler_discovery:5000"
-      PORT: 50051
-      HOST: "lightwood"
-      MINDSDB_SERVICE_TYPE: "lightwood"
-      MINDSDB_STORAGE_DIR: "/mindsdb/var"
-      MINDSDB_DB_SERVICE_HOST: "db_service"
-      MINDSDB_DB_SERVICE_PORT: "50050"
+      - ./config/nginx/gateway_docker_compose.conf:/etc/nginx/nginx.conf
+    ports:
+      - '3000:3000'
 
-  huggingface:
-    build:
-      context: ../
-      dockerfile: ./docker/ml_handler.Dockerfile
+  gateway_auth:
+    command:  bash -c "cd mindsdb_gateway && python3 service_auth/auth_server.py"
     depends_on:
-      - mindsdb
-    volumes:
-      - type: bind
-        source: ../
-        target: /mindsdb
+      gateway_db:
+        condition: service_healthy
+      mindsdb_db:
+        condition: service_healthy
+          # front:
+          #   condition: service_healthy
+    image: 454861456664.dkr.ecr.us-east-2.amazonaws.com/mindsdb-mindsdb-gateway-auth:latest
+    ports:
+      - '8092:8092'
+    platform: linux/amd64
     environment:
-      # have to share mindsdb database, because it doens't work without it
-      PORT: 50053
-      HOST: "huggingface"
-      MINDSDB_SERVICE_TYPE: "huggingface"
-      MINDSDB_STORAGE_DIR: "/mindsdb/var"
-      REGISTRY_URL: "http://handler_discovery:5000"
-      MINDSDB_DB_SERVICE_HOST: "db_service"
-      MINDSDB_DB_SERVICE_PORT: "50050"
-
-
-  db_service:
-    build:
-      context: ../
-      dockerfile: ./docker/db_handler.Dockerfile
-    depends_on:
-      - mindsdb
-        # - mysql_db
-    volumes:
-      - type: bind
-        source: ../
-        target: /mindsdb
-    environment:
-      MINDSDB_STORAGE_DIR: "/mindsdb/var"
-      PORT: "50050"
-
+      CLOUD_CONFIG: "prod.config_k8s"
+      PORT_AUTH: 8092
+      DATABASE_URL: "postgresql://postgres:postgres@gateway_db:25432/gateway"
+      AUTHLIB_INSECURE_TRANSPORT: 1
     healthcheck:
-      test:  ["CMD", "curl", "-f", "http://localhost:5000"]
-      interval: 120s
+      test:  ["CMD", "curl", "-f", "http://localhost:8092/healthy"]
+      interval: 10s
       timeout: 4s
-      retries: 100
+      retries: 5
 
-  executor:
-    build:
-      context: ../
-      dockerfile: ./docker/executor.Dockerfile
+  gateway:
+    restart: always
     depends_on:
-      - mindsdb
+      gateway_db:
+        condition: service_healthy
+      mindsdb_db:
+        condition: service_healthy
+      gateway_auth:
+        condition: service_healthy
+    image: 454861456664.dkr.ecr.us-east-2.amazonaws.com/mindsdb-mindsdb-gateway:latest
+    ports:
+      - '8001:8001'
+      - '27017:27017'
+      - '3306:3306'
+    platform: linux/amd64
     environment:
-      # have to share mindsdb database, because it doens't work without it
-      # PORT: 5002
-      PORT: 50052
-      MINDSDB_STORAGE_DIR: "/mindsdb/var"
-        # BALANCER_URL: "http://balancer:80"
-      MINDSDB_DB_SERVICE_HOST: "db_service"
-      MINDSDB_DB_SERVICE_PORT: "50050"
-        # MINDSDB_ML_SERVICE_HOST: "lightwood"
-        # MINDSDB_ML_SERVICE_PORT: "50051"
-      REGISTRY_URL: "http://handler_discovery:5000"
-    volumes:
-      - type: bind
-        source: ../
-        target: /mindsdb
-    healthcheck:
-      test:  ["CMD", "curl", "-f", "http://localhost:5000"]
-      interval: 120s
-      timeout: 4s
-      retries: 100
+      PYTHONPATH: "/"
+      LOCAL: True
+      CLOUD_CONFIG: "prod.config_k8s"
+      PORT_HTTP: 8001
+      PORT_MONGODB: 27017
+      PORT_MYSQL: 3306
+      PORT_AUTH: 8092
+      HOST_AUTH: gateway_auth
+      MINDSDB_MONGO_HTTP: 47334
+      MINDSDB_MYSQL_PORT: 47335
+      MINDSDB_MONGO_PORT: 47336
+      LOG_FOLDER: "./logs"
+      RUN_APIS: "http,mongodb,mysql"
+      PRODUCTION_LIGHTWOOD_SOURCE: "None"
+      DATABASE_URL: "postgresql://postgres:postgres@gateway_db:25432/gateway"
+      MINDSDB_DATABASE_URL: "postgresql://postgres:postgres@mindsdb_db:15432/mindsdb"
+      MINDSDB_DB_CON: "postgresql://postgres:postgres@mindsdb_db:15432/mindsdb"
+      MINDSDB_K8S_CLUSTER_HOST: "mindsdb"
+      MINDSDB_K8S_CLUSTER_PORT: "47334"
 
-  handler_discovery:
-    build:
-      context: .
-      dockerfile: ./handler_discovery.Dockerfile
-    environment:
-      PORT: 5000
+      S3_BUCKET: "mdb-dev-mindsdb-gateway-454861456664-us-east-2"
+      GUI_ZIP: "https://mindsdb-web-builds.s3.amazonaws.com/build_cloud_V0_1_0.zip"
+      HOST: "gateway.dev.mindsdb.com"
+      # TODO: What is this for?
+      ID: "cloud-kubernetes-dev-0"
+      #INTERCOM_API_KEY: "dG9rOmMzNTk2NmE4XzFjYWNfNDM4Zl9iMzUzXzEyNmY5MmVhMzdiMToxOjA="
+      #INTERCOM_USER_ID_PREFIX: "STOCKHOLM"
+      AUTH_CLIENT_ID: gD5DE2ksTBW1syJsuMFRqB9l
+      AUTH_CLIENT_SECRET: MbO6oeDrgIcBaByuUMTCcsE5hiYN3MRTW8VBYX7ZuifYeDOa
+        
